@@ -40,7 +40,8 @@ qsub -v PULL_ONLY=1 -l select=1:ncpus=2:mem=16gb:scratch_local=40gb -l walltime=
 ```
 
 Hotovo je, až je v `~/smart-mirror` soubor `smart-mirror-sha-….sif` bez
-`.tmp`. Když SIF chybí, udělá převod i GPU úloha, jen to déle trvá.
+`.tmp`. Převod potřebuje ve scratchi zhruba 25 GB: stažené vrstvy, rozbalený
+archiv a dočasné soubory Singularity. Když SIF chybí, udělá převod i GPU úloha, jen to déle trvá.
 
 ## Spuštění
 
@@ -107,9 +108,14 @@ qdel <jobid>
 - **`qsub` odmítne `gpu_cap`:** syntaxe se liší mezi PBS Pro a OpenPBS.
   Správný tvar ukáže [qsub assembler](https://my.metacentrum.cz/qsub-assembler).
 - **Port:** úloha si volný port vybere sama, protože uzel sdílí víc úloh.
-- **`stream error … PROTOCOL_ERROR` při převodu:** přerušené stahování
-  velké vrstvy z ghcr.io. Úloha stahuje přes HTTP/1.1 a zkouší to třikrát,
-  pak stačí ji poslat znovu.
+- **Proč úloha nestahuje přes `singularity build docker://…`:** ghcr.io
+  vydává vrstvy přes odkazy do CDN, které platí jen pár minut. Vrstva
+  s torchem má 4 GiB a za tu dobu se nestihne stáhnout. Singularity pak
+  spadne (`stream error … PROTOCOL_ERROR`, `unexpected EOF`) a neumí navázat.
+  Úloha proto stahuje vrstvy vlastním skriptem (čistý `python3`): po přerušení
+  si vyžádá nový odkaz, pokračuje od místa, kde skončila, a kontroluje
+  sha256. Z vrstev složí `docker-archive` a z něj postaví SIF. Ve výstupu
+  uvidíš řádky „přerušeno na … MiB“, to je v pořádku.
 
 ## Licence
 

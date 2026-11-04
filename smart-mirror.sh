@@ -46,16 +46,181 @@ nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>
 # Image se převede na SIF jen poprvé a pak se bere ze storage.
 # Vrstvy a dočasné soubory jdou do scratche (Singularity to při $SCRATCHDIR nastaví sám).
 if [ ! -f "$SIF" ]; then
-    echo "Převádím docker://ghcr.io/jsitera/smart-mirror:$IMAGE_TAG na $SIF…"
-    # Stahování velké vrstvy (torch) přes HTTP/2 z ghcr.io umí spadnout na
-    # "stream error … PROTOCOL_ERROR". HTTP/1.1 a pár pokusů.
-    export GODEBUG=http2client=0
-    for try in 1 2 3; do
-        singularity build --force "$SIF.tmp" "docker://ghcr.io/jsitera/smart-mirror:$IMAGE_TAG" && break
-        [ "$try" = 3 ] && { echo "Převod image se nepovedl ani na třetí pokus."; exit 1; }
-        echo "Převod selhal, zkouším znovu za 30 s ($try/3)…"
-        sleep 30
-    done
+    # Ne `singularity build docker://…`: ghcr.io vydává vrstvy přes odkazy do CDN
+    # platné pár minut, 4GiB vrstva s torchem se nestihne stáhnout a Singularity
+    # neumí navázat. Python níže stahuje s navazováním a složí docker-archive.
+    echo "Stahuju ghcr.io/jsitera/smart-mirror:$IMAGE_TAG…"
+    python3 - "ghcr.io/jsitera/smart-mirror:$IMAGE_TAG" "$SCRATCHDIR/image.tar" "$SCRATCHDIR/blobs" <<'PY'
+"""Stáhne image z ghcr.io s navazováním a složí z něj docker-archive pro Singularity.
+
+ghcr.io vydává vrstvy přes podepsané odkazy do CDN, které platí jen pár minut,
+a vrstva s torchem (4 GiB) se za tu dobu nestihne stáhnout. `singularity build
+docker://…` pak spadne a začne znovu od nuly. Tady se při přerušení vyžádá nový
+odkaz a stahuje se dál od místa, kde přestalo (HTTP Range).
+
+  python3 - ghcr.io/jsitera/smart-mirror:sha-… výstup.tar pracovní_adresář
+  singularity build obraz.sif docker-archive:výstup.tar
+
+Jen standardní knihovna, běží na čistém python3 na uzlu.
+"""
+import gzip
+import hashlib
+import http.client
+import io
+import json
+import os
+import shutil
+import sys
+import tarfile
+import time
+import urllib.error
+import urllib.request
+
+ACCEPT = ", ".join([
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+])
+CHUNK = 1 << 20
+ATTEMPTS = 30
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    # přesměrování na CDN chceme vidět: podepsaný odkaz nesmí dostat náš token
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+OPENER = urllib.request.build_opener(NoRedirect)
+
+
+def token(registry: str, repo: str) -> str:
+    url = f"https://{registry}/token?scope=repository:{repo}:pull"
+    with urllib.request.urlopen(url, timeout=30) as r:
+        return json.load(r)["token"]
+
+
+def get_json(registry: str, repo: str, ref: str) -> tuple[bytes, dict]:
+    req = urllib.request.Request(
+        f"https://{registry}/v2/{repo}/manifests/{ref}",
+        headers={"Authorization": f"Bearer {token(registry, repo)}", "Accept": ACCEPT})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        raw = r.read()
+    return raw, json.loads(raw)
+
+
+def blob_url(registry: str, repo: str, digest: str) -> str:
+    """Vrátí podepsaný odkaz do CDN (platí jen pár minut, proto pokaždé nový)."""
+    req = urllib.request.Request(f"https://{registry}/v2/{repo}/blobs/{digest}",
+                                 headers={"Authorization": f"Bearer {token(registry, repo)}"})
+    try:
+        with OPENER.open(req, timeout=60) as r:
+            return r.geturl()  # bez přesměrování: registry vrací blob samo
+    except urllib.error.HTTPError as e:
+        if e.code in (301, 302, 303, 307, 308):
+            return e.headers["Location"]
+        raise
+
+
+def download(registry: str, repo: str, digest: str, size: int, path: str) -> None:
+    """Stáhne blob do path, při přerušení pokračuje od místa, kde přestal."""
+    attempt = 0
+    while (have := os.path.getsize(path) if os.path.exists(path) else 0) != size:
+        attempt += 1
+        if attempt > ATTEMPTS:
+            raise SystemExit(f"Blob {digest} se nepodařilo stáhnout ani na {ATTEMPTS}. pokus.")
+        if have > size:
+            os.remove(path)
+            continue
+        try:
+            url = blob_url(registry, repo, digest)
+            req = urllib.request.Request(url, headers={"Range": f"bytes={have}-"} if have else {})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                if have and r.status != 206:
+                    have = 0  # server rozsah ignoroval, začni znovu
+                with open(path, "ab" if have else "wb") as f:
+                    shutil.copyfileobj(r, f, CHUNK)
+        except (OSError, http.client.HTTPException) as e:  # URLError je OSError
+            got = os.path.getsize(path) if os.path.exists(path) else 0
+            print(f"  {digest[7:19]}: přerušeno na {got / 2**20:.0f} MiB z {size / 2**20:.0f} "
+                  f"({e.__class__.__name__}), pokus {attempt}/{ATTEMPTS}", flush=True)
+            time.sleep(min(5 * attempt, 30))
+    if sha256_file(path) != digest:
+        os.remove(path)
+        raise SystemExit(f"Blob {digest} nesedí na kontrolní součet, smazán.")
+
+
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(CHUNK):
+            h.update(chunk)
+    return "sha256:" + h.hexdigest()
+
+
+def main() -> None:
+    image, out, work = sys.argv[1], sys.argv[2], sys.argv[3]
+    registry, rest = image.split("/", 1)
+    repo, tag = rest.rsplit(":", 1)
+    os.makedirs(work, exist_ok=True)
+
+    _, index = get_json(registry, repo, tag)
+    if "manifests" in index:  # index více platforem: vezmi linux/amd64
+        digest = next(m["digest"] for m in index["manifests"]
+                      if m.get("platform", {}).get("architecture") == "amd64"
+                      and m.get("platform", {}).get("os") == "linux")
+        _, manifest = get_json(registry, repo, digest)
+    else:
+        manifest = index
+
+    cfg = manifest["config"]
+    cfg_path = os.path.join(work, cfg["digest"][7:] + ".json")
+    download(registry, repo, cfg["digest"], cfg["size"], cfg_path)
+    diff_ids = json.load(open(cfg_path))["rootfs"]["diff_ids"]
+    layers = manifest["layers"]
+    assert len(diff_ids) == len(layers), (len(diff_ids), len(layers))
+    total = sum(l["size"] for l in layers)
+    print(f"{image}: {len(layers)} vrstev, {total / 2**30:.2f} GiB", flush=True)
+
+    # docker-archive (formát `docker save`): manifest.json, config a nekomprimované vrstvy
+    names = []
+    with tarfile.open(out, "w") as tar:
+        tar.add(cfg_path, arcname=os.path.basename(cfg_path))
+        for layer, diff_id in zip(layers, diff_ids):
+            gz = os.path.join(work, layer["digest"][7:] + ".gz")
+            download(registry, repo, layer["digest"], layer["size"], gz)
+            raw = gz[:-3] + ".tar"
+            if layer["mediaType"].endswith("gzip"):
+                with gzip.open(gz, "rb") as src, open(raw, "wb") as dst:
+                    shutil.copyfileobj(src, dst, CHUNK)
+                os.remove(gz)
+            elif layer["mediaType"].endswith(".tar"):
+                os.rename(gz, raw)
+            else:
+                raise SystemExit(f"Neznámý typ vrstvy {layer['mediaType']}.")
+            if sha256_file(raw) != diff_id:
+                raise SystemExit(f"Rozbalená vrstva {layer['digest']} nesedí na {diff_id}.")
+            name = diff_id[7:] + "/layer.tar"
+            tar.add(raw, arcname=name)
+            os.remove(raw)
+            names.append(name)
+            print(f"  hotovo {layer['digest'][7:19]} ({layer['size'] / 2**20:.0f} MiB)", flush=True)
+        meta = json.dumps([{"Config": os.path.basename(cfg_path),
+                            "RepoTags": [f"{registry}/{repo}:{tag}"],
+                            "Layers": names}]).encode()
+        info = tarfile.TarInfo("manifest.json")
+        info.size = len(meta)
+        tar.addfile(info, io.BytesIO(meta))
+    print(f"docker-archive: {out}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
+PY
+    echo "Převádím na $SIF…"
+    singularity build --force "$SIF.tmp" "docker-archive:$SCRATCHDIR/image.tar"
+    rm -rf "$SCRATCHDIR/image.tar" "$SCRATCHDIR/blobs"
     mv "$SIF.tmp" "$SIF"
 fi
 if [ -n "${PULL_ONLY:-}" ]; then
