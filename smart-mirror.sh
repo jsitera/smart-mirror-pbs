@@ -9,10 +9,16 @@
 #   mkdir -p ~/smart-mirror && chmod 700 ~/smart-mirror
 #   (umask 077; cat > ~/smart-mirror/hf_token)      # vložit HF token, Ctrl-D
 #
+# Poprvé (a po změně tagu image) převést image na SIF bez GPU, ať úloha
+# na GPU nečeká na stahování (-l na příkazové řádce přebije #PBS níže):
+#   qsub -v PULL_ONLY=1 -l select=1:ncpus=2:mem=16gb:scratch_local=40gb -l walltime=1:00:00 \
+#     ~/smart-mirror-pbs/smart-mirror.sh
+#
 # Spuštění z frontendu:
 #   git -C ~/smart-mirror-pbs pull && qsub ~/smart-mirror-pbs/smart-mirror.sh
 #   qsub -v SM_DIR=/storage/<lokalita>/home/$USER/smart-mirror ~/smart-mirror-pbs/smart-mirror.sh
 #
+# Výstup úlohy je průběžně v $SM_DIR/job-<jobid>.log (soubor .o přijde až po konci).
 # Až úloha poběží, v $SM_DIR/connect-<jobid>.txt je příkaz pro tunel a URL.
 # Ukončení (uvolní GPU): qdel <jobid>
 #
@@ -31,17 +37,30 @@ SM_DIR=${SM_DIR:-$HOME/smart-mirror}
 SIF=$SM_DIR/smart-mirror-$IMAGE_TAG.sif
 NODE=$(hostname -f)
 JOB=${PBS_JOBID%%.*}
+exec > >(tee -a "$SM_DIR/job-$JOB.log") 2>&1
 
 echo "uzel $NODE, úloha $PBS_JOBID, scratch $SCRATCHDIR"
-nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader || true
+nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>/dev/null || echo "bez GPU"
 # Torch v image je cu128: potřebuje ovladač 570+. Se starším spadne při načtení modelu.
 
 # Image se převede na SIF jen poprvé a pak se bere ze storage.
 # Vrstvy a dočasné soubory jdou do scratche (Singularity to při $SCRATCHDIR nastaví sám).
 if [ ! -f "$SIF" ]; then
     echo "Převádím docker://ghcr.io/jsitera/smart-mirror:$IMAGE_TAG na $SIF…"
-    singularity build "$SIF.tmp" "docker://ghcr.io/jsitera/smart-mirror:$IMAGE_TAG"
+    # Stahování velké vrstvy (torch) přes HTTP/2 z ghcr.io umí spadnout na
+    # "stream error … PROTOCOL_ERROR". HTTP/1.1 a pár pokusů.
+    export GODEBUG=http2client=0
+    for try in 1 2 3; do
+        singularity build --force "$SIF.tmp" "docker://ghcr.io/jsitera/smart-mirror:$IMAGE_TAG" && break
+        [ "$try" = 3 ] && { echo "Převod image se nepovedl ani na třetí pokus."; exit 1; }
+        echo "Převod selhal, zkouším znovu za 30 s ($try/3)…"
+        sleep 30
+    done
     mv "$SIF.tmp" "$SIF"
+fi
+if [ -n "${PULL_ONLY:-}" ]; then
+    echo "Image je připravený: $SIF"
+    exit 0
 fi
 
 # Váhy SAM 3 a Depth Anything 3 se stáhnou jednou na storage (image je jen ke čtení).

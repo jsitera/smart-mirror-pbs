@@ -27,6 +27,21 @@ Spouštěcí soubory jsou v `~/smart-mirror-pbs`. Data jsou zvlášť v `~/smart
 
 `git pull` tak nic z toho nepřepíše.
 
+## Převod image (poprvé a po změně tagu)
+
+Image se převádí na SIF jen jednou a pak se bere ze storage. Převod udělej
+předem jako úlohu bez GPU, ať GPU úloha nečeká na stahování několika GB.
+Parametry `-l` na příkazové řádce přebijí `#PBS` ve skriptu:
+
+```bash
+git -C ~/smart-mirror-pbs pull
+qsub -v PULL_ONLY=1 -l select=1:ncpus=2:mem=16gb:scratch_local=40gb -l walltime=1:00:00 \
+  ~/smart-mirror-pbs/smart-mirror.sh
+```
+
+Hotovo je, až je v `~/smart-mirror` soubor `smart-mirror-sha-….sif` bez
+`.tmp`. Když SIF chybí, udělá převod i GPU úloha, jen to déle trvá.
+
 ## Spuštění
 
 ```bash
@@ -71,6 +86,8 @@ kameru. Adresa `localhost` je pro Chrome secure context, takže kamera funguje
 i bez HTTPS. Laser zapneš zaškrtávátkem **laser**.
 
 Načtení modelů trvá pár minut, průběh je v `~/smart-mirror/server-<jobid>.log`.
+Výstup samotné úlohy (GPU, ovladač, převod image) je průběžně
+v `~/smart-mirror/job-<jobid>.log`. Soubor `.o` přijde až po skončení.
 Soubor s URL i log obsahují token a mají práva jen pro tebe.
 
 ## Ukončení
@@ -84,11 +101,15 @@ qdel <jobid>
 ## Když něco nejde
 
 - **Starý ovladač GPU:** torch v image je pro CUDA 12.8 a potřebuje ovladač
-  570+. Verzi ovladače vypíše úloha na začátku do svého výstupu (`.o` soubor
-  po skončení). Se starším ovladačem server spadne při načtení modelu.
+  570+. Verzi ovladače vypíše úloha na začátku do `job-<jobid>.log`. Se starším
+  ovladačem server spadne při načtení modelu. L40S na fobos měla 4. 11. 2026
+  ovladač 610.57, to stačí.
 - **`qsub` odmítne `gpu_cap`:** syntaxe se liší mezi PBS Pro a OpenPBS.
   Správný tvar ukáže [qsub assembler](https://my.metacentrum.cz/qsub-assembler).
 - **Port:** úloha si volný port vybere sama, protože uzel sdílí víc úloh.
+- **`stream error … PROTOCOL_ERROR` při převodu:** přerušené stahování
+  velké vrstvy z ghcr.io. Úloha stahuje přes HTTP/1.1 a zkouší to třikrát,
+  pak stačí ji poslat znovu.
 
 ## Licence
 
