@@ -243,8 +243,8 @@ TOKEN=$(singularity exec "$SIF" python -c 'import secrets; print(secrets.token_u
 
 cat > "$SM_DIR/connect-$JOB.txt" <<EOF
 Úloha $PBS_JOBID na $NODE, port $PORT (start $(date '+%F %T')).
-Na notebooku (frontend libovolný, např. ten, ze kterého jsi úlohu poslal):
-  ssh -N -L 8770:$NODE:$PORT $USER@<frontend>
+Na notebooku (výpočetní uzly MetaCentra jsou přístupné přímo, tunel vede na uzel):
+  ssh -N -L 8770:localhost:$PORT $USER@$NODE
 Pak v Chrome:
   http://localhost:8770/?token=$TOKEN
 Načtení modelů trvá pár minut, průběh je v $SM_DIR/server-$JOB.log.
@@ -252,6 +252,6 @@ Ukončení: qdel $PBS_JOBID
 EOF
 echo "Připojení: $SM_DIR/connect-$JOB.txt"
 
-# Server poslouchá na všech rozhraních uzlu, aby na něj došel tunel z frontendu;
+# Server poslouchá na všech rozhraních uzlu (tunel jde i přes frontend: -L 8770:$NODE:$PORT);
 # bez tokenu stránka vrací 401 a WebSocket 4401.
 "${RUN[@]}" --port "$PORT" --token "$TOKEN" > "$SM_DIR/server-$JOB.log" 2>&1

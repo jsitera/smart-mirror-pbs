@@ -76,11 +76,15 @@ URL v souboru:
 cat ~/smart-mirror/connect-<jobid>.txt
 ```
 
-Na notebooku pak:
+Výpočetní uzly MetaCentra jsou přístupné přímo, tunel tedy vede rovnou na
+uzel úlohy. Na notebooku (Linux, macOS i PowerShell ve Windows 10/11):
 
 ```bash
-ssh -N -L 8770:<uzel>:<port> <login>@<frontend>
+ssh -N -L 8770:localhost:<port> <login>@<uzel>
 ```
+
+Příkaz nic nevypíše a jen drží spojení, okno nech otevřené. Když je lokální
+port 8770 obsazený, použij jiný (`-L 18770:…`) a uprav i URL.
 
 V Chrome otevři `http://localhost:8770/?token=…`, stiskni **Start** a povol
 kameru. Adresa `localhost` je pro Chrome secure context, takže kamera funguje
